@@ -1,0 +1,13 @@
+# Build directories
+build/
+*/build/
+
+# Experiment outputs
+experiments/*/runs/
+experiments/*/output/
+
+# OS/editor cruft
+.DS_Store
+*.swp
+*.swo
+*~
