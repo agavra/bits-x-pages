@@ -5,7 +5,8 @@ Scratchpad repo for the "Bits x Pages" blog. Every post gets its own standalone 
 ## Layout
 
 - `experiments/`: one subdirectory per post or idea. Each directory owns its source, build files, helper scripts, and README.
-- `experiments/lsm-space-amp`: current RocksDB block-size/space amplification benchmark (C++/CMake).
+- `experiments/lsm-space-amp`: RocksDB block-size/space amplification benchmark (C++/CMake).
+- `experiments/rocksdb-merge-bench`: merge-operator vs read-modify-write throughput benchmark (C++/CMake).
 - `build/`: example build tree for the LSM experiment (feel free to create separate `build/<experiment>` directories per project).
 - `space_amp_runs/`: output from the LSM benchmark (delete between runs if desired).
 
