@@ -2,6 +2,22 @@
 build/
 */build/
 
+# Rust build artifacts
+**/target/
+**/*.rs.bk
+Cargo.lock
+
+# Rust debug/profiling
+*.pdb
+perf.data*
+flamegraph.svg
+
+# Rust coverage
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.*
+
 # Experiment outputs
 experiments/*/runs/
 experiments/*/output/

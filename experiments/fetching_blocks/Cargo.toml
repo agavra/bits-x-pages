@@ -1,0 +1,14 @@
+[package]
+name = "fetching_blocks"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "disk_io"
+harness = false
