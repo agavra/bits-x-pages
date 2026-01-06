@@ -1,5 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::fs::{self, File};
+use std::io;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
@@ -15,14 +16,28 @@ fn create_test_file(path: &Path, size: usize) {
 }
 
 /// Open a file with F_NOCACHE to bypass OS cache (macOS only)
-fn open_nocache(path: &Path) -> std::io::Result<File> {
+#[cfg(target_os = "macos")]
+fn open_nocache(path: &Path) -> io::Result<File> {
+    use std::os::unix::io::AsRawFd;
+
     let file = File::open(path)?;
     unsafe {
         if libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) == -1 {
-            return Err(std::io::Error::last_os_error());
+            return Err(io::Error::last_os_error());
         }
     }
     Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn open_nocache(path: &Path) -> io::Result<File> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)
 }
 
 /// Read specified number of bytes from a file using F_NOCACHE
