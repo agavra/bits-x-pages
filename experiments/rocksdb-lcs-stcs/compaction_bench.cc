@@ -45,6 +45,8 @@ struct Config {
   int duration_secs = 60;             // Duration of mixed workload phase
   int threads = 4;                    // Number of worker threads
   bool keep_dbs = false;
+  bool reuse_db = false;              // Skip bulk load, reuse existing database
+  bool no_compaction = false;         // Disable background compaction (for clean read tests)
   bool verbose = false;
 };
 
@@ -139,6 +141,11 @@ Config ParseArguments(int argc, char** argv) {
       cfg.threads = std::stoi(std::string(arg.substr(std::string_view("--threads=").size())));
     } else if (arg == "--keep_dbs") {
       cfg.keep_dbs = true;
+    } else if (arg == "--reuse_db") {
+      cfg.reuse_db = true;
+      cfg.keep_dbs = true;  // Implied: must keep DBs to reuse them
+    } else if (arg == "--no_compaction") {
+      cfg.no_compaction = true;
     } else if (arg == "--verbose" || arg == "-v") {
       cfg.verbose = true;
     } else if (arg == "--help" || arg == "-h") {
@@ -146,13 +153,15 @@ Config ParseArguments(int argc, char** argv) {
                 << "Compares Leveled (LCS) vs Universal (STCS) compaction strategies.\n\n"
                 << "Options:\n"
                 << "  --db_root=PATH       Directory for database files (default: ./compaction_bench_runs)\n"
-                << "  --data_size_mb=N     Logical data size in MB (default: 512)\n"
+                << "  --data_size_mb=N     Logical data size in MB (default: 2048)\n"
                 << "  --value_size=N       Value size in bytes (default: 128)\n"
                 << "  --read_percent=N     Read percentage in mixed workload (default: 50)\n"
                 << "  --update_rate=N      0 = all new keys, 100 = all updates (default: 100)\n"
                 << "  --duration_secs=N    Duration of mixed workload phase (default: 60)\n"
                 << "  --threads=N          Number of worker threads (default: 4)\n"
                 << "  --keep_dbs           Keep database directories after benchmark\n"
+                << "  --reuse_db           Reuse existing DB, skip bulk load (measures updates only)\n"
+                << "  --no_compaction      Disable background compaction (for clean read tests)\n"
                 << "  --verbose, -v        Print verbose progress\n"
                 << "  --help, -h           Show this help message\n";
       std::exit(EXIT_SUCCESS);
@@ -242,15 +251,20 @@ rocksdb::Options BuildLeveledOptions(const Config& cfg,
   options.max_background_compactions = 4;
   options.max_background_flushes = 2;
 
+  // Optionally disable auto compaction for clean read tests
+  options.disable_auto_compactions = cfg.no_compaction;
+
   // Direct I/O - bypass OS cache
   options.use_direct_reads = true;
   options.use_direct_io_for_flush_and_compaction = true;
   options.compaction_readahead_size = 2 * 1024 * 1024;
 
-  // Block-based table options - disable block cache
+  // Block-based table options - use tiny block cache to track misses
   rocksdb::BlockBasedTableOptions table_options;
   table_options.block_size = 4 * 1024;  // 4 KB blocks
-  table_options.no_block_cache = true;
+  // Enable tiny cache (8KB) so BLOCK_CACHE_MISS gets tracked
+  // Everything will miss, giving us accurate disk read counts
+  table_options.block_cache = rocksdb::NewLRUCache(8 * 1024);
   table_options.cache_index_and_filter_blocks = false;
   table_options.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10, false));
 
@@ -295,15 +309,19 @@ rocksdb::Options BuildUniversalOptions(const Config& cfg,
   options.max_background_compactions = 4;
   options.max_background_flushes = 2;
 
+  // Optionally disable auto compaction for clean read tests
+  options.disable_auto_compactions = cfg.no_compaction;
+
   // Direct I/O
   options.use_direct_reads = true;
   options.use_direct_io_for_flush_and_compaction = true;
   options.compaction_readahead_size = 2 * 1024 * 1024;
 
-  // Block-based table options
+  // Block-based table options - use tiny block cache to track misses
   rocksdb::BlockBasedTableOptions table_options;
   table_options.block_size = 4 * 1024;
-  table_options.no_block_cache = true;
+  // Enable tiny cache (8KB) so BLOCK_CACHE_MISS gets tracked
+  table_options.block_cache = rocksdb::NewLRUCache(8 * 1024);
   table_options.cache_index_and_filter_blocks = false;
   table_options.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10, false));
 
@@ -402,12 +420,27 @@ Result RunBenchmark(const Config& cfg, const std::string& strategy_name,
 
   const std::filesystem::path db_path = cfg.db_root / strategy_name;
   std::filesystem::create_directories(cfg.db_root);
-  if (std::filesystem::exists(db_path)) {
+
+  bool db_exists = std::filesystem::exists(db_path);
+
+  // Handle reuse_db mode
+  if (cfg.reuse_db && !db_exists) {
+    throw std::runtime_error("--reuse_db specified but database does not exist at " + db_path.string() +
+                             "\nRun once without --reuse_db to create the database first.");
+  }
+
+  if (!cfg.reuse_db && db_exists) {
     std::filesystem::remove_all(db_path);
   }
 
   auto stats = rocksdb::CreateDBStatistics();
   rocksdb::Options options = build_options(cfg, stats);
+
+  // Allow opening existing database when reusing
+  if (cfg.reuse_db) {
+    options.create_if_missing = false;
+    options.error_if_exists = false;
+  }
 
   rocksdb::DB* raw_db = nullptr;
   auto status = rocksdb::DB::Open(options, db_path.string(), &raw_db);
@@ -416,83 +449,90 @@ Result RunBenchmark(const Config& cfg, const std::string& strategy_name,
   }
   std::unique_ptr<rocksdb::DB> db(raw_db);
 
-  std::cout << "  [" << strategy_name << "] Phase 1: Bulk loading "
-            << HumanNumber(cfg.key_count) << " keys (" << cfg.data_size_mb << " MB)...\n";
-
-  // Phase 1: Bulk load with randomized key order
-  // Shuffle keys to create overlapping SSTs and force real compaction work
-  auto load_start = std::chrono::steady_clock::now();
-
-  std::cout << "  [" << strategy_name << "] Generating shuffled key order...\n";
-  std::vector<uint64_t> key_indices(cfg.key_count);
-  std::iota(key_indices.begin(), key_indices.end(), 0);
-  std::mt19937_64 shuffle_rng(0xDEADBEEF);  // Fixed seed for reproducibility
-  std::shuffle(key_indices.begin(), key_indices.end(), shuffle_rng);
-
-  rocksdb::WriteOptions write_opts;
-  write_opts.disableWAL = true;  // Faster bulk load
-  rocksdb::WriteBatch batch;
-  const size_t batch_size = 1000;
-
-  std::array<char, kKeySize + 1> key_buffer{};
-  std::vector<char> value_buffer(cfg.value_size);
-
   uint64_t user_bytes_written = 0;
   uint64_t peak_disk = 0;
+  IOStats io_after_load{};  // Zero-initialized for reuse_db mode
 
-  for (uint64_t i = 0; i < cfg.key_count; ++i) {
-    uint64_t key_idx = key_indices[i];
-    FormatKey(key_idx, &key_buffer);
-    FillValue(key_idx, value_buffer.data(), cfg.value_size);
-    rocksdb::Slice key_slice(key_buffer.data(), kKeySize);
-    rocksdb::Slice value_slice(value_buffer.data(), cfg.value_size);
-    batch.Put(key_slice, value_slice);
-    user_bytes_written += kKeySize + cfg.value_size;
+  // Phase 1: Bulk load (skip if reusing existing database)
+  if (!cfg.reuse_db) {
+    std::cout << "  [" << strategy_name << "] Phase 1: Bulk loading "
+              << HumanNumber(cfg.key_count) << " keys (" << cfg.data_size_mb << " MB)...\n";
 
-    if (batch.Count() >= static_cast<int>(batch_size)) {
+    // Shuffle keys to create overlapping SSTs and force real compaction work
+    auto load_start = std::chrono::steady_clock::now();
+
+    std::cout << "  [" << strategy_name << "] Generating shuffled key order...\n";
+    std::vector<uint64_t> key_indices(cfg.key_count);
+    std::iota(key_indices.begin(), key_indices.end(), 0);
+    std::mt19937_64 shuffle_rng(0xDEADBEEF);  // Fixed seed for reproducibility
+    std::shuffle(key_indices.begin(), key_indices.end(), shuffle_rng);
+
+    rocksdb::WriteOptions write_opts;
+    write_opts.disableWAL = true;  // Faster bulk load
+    rocksdb::WriteBatch batch;
+    const size_t batch_size = 1000;
+
+    std::array<char, kKeySize + 1> key_buffer{};
+    std::vector<char> value_buffer(cfg.value_size);
+
+    for (uint64_t i = 0; i < cfg.key_count; ++i) {
+      uint64_t key_idx = key_indices[i];
+      FormatKey(key_idx, &key_buffer);
+      FillValue(key_idx, value_buffer.data(), cfg.value_size);
+      rocksdb::Slice key_slice(key_buffer.data(), kKeySize);
+      rocksdb::Slice value_slice(value_buffer.data(), cfg.value_size);
+      batch.Put(key_slice, value_slice);
+      user_bytes_written += kKeySize + cfg.value_size;
+
+      if (batch.Count() >= static_cast<int>(batch_size)) {
+        status = db->Write(write_opts, &batch);
+        if (!status.ok()) {
+          throw std::runtime_error("Write failed: " + status.ToString());
+        }
+        batch.Clear();
+
+        // Track peak disk usage during load
+        uint64_t current_disk = GetDiskUsage(db.get());
+        peak_disk = std::max(peak_disk, current_disk);
+      }
+
+      // Progress indicator
+      if (cfg.verbose && (i + 1) % (cfg.key_count / 10) == 0) {
+        std::cout << "    " << ((i + 1) * 100 / cfg.key_count) << "% loaded\n";
+      }
+    }
+
+    if (batch.Count() > 0) {
       status = db->Write(write_opts, &batch);
       if (!status.ok()) {
         throw std::runtime_error("Write failed: " + status.ToString());
       }
       batch.Clear();
-
-      // Track peak disk usage during load
-      uint64_t current_disk = GetDiskUsage(db.get());
-      peak_disk = std::max(peak_disk, current_disk);
     }
 
-    // Progress indicator
-    if (cfg.verbose && (i + 1) % (cfg.key_count / 10) == 0) {
-      std::cout << "    " << ((i + 1) * 100 / cfg.key_count) << "% loaded\n";
-    }
+    // Flush and wait for compactions to settle
+    rocksdb::FlushOptions flush_opts;
+    flush_opts.wait = true;
+    db->Flush(flush_opts);
+
+    std::cout << "  [" << strategy_name << "] Waiting for compactions to settle...\n";
+    WaitForCompactions(db.get());
+
+    auto load_end = std::chrono::steady_clock::now();
+    result.load_duration_secs = std::chrono::duration<double>(load_end - load_start).count();
+
+    // Get stats after bulk load
+    io_after_load = GetIOStats(stats);
+    uint64_t disk_after_load = GetDiskUsage(db.get());
+    peak_disk = std::max(peak_disk, disk_after_load);
+
+    std::cout << "  [" << strategy_name << "] Bulk load complete. Disk usage: "
+              << HumanBytes(disk_after_load) << "\n";
+  } else {
+    std::cout << "  [" << strategy_name << "] Reusing existing database. Disk usage: "
+              << HumanBytes(GetDiskUsage(db.get())) << "\n";
+    peak_disk = GetDiskUsage(db.get());
   }
-
-  if (batch.Count() > 0) {
-    status = db->Write(write_opts, &batch);
-    if (!status.ok()) {
-      throw std::runtime_error("Write failed: " + status.ToString());
-    }
-    batch.Clear();
-  }
-
-  // Flush and wait for compactions to settle
-  rocksdb::FlushOptions flush_opts;
-  flush_opts.wait = true;
-  db->Flush(flush_opts);
-
-  std::cout << "  [" << strategy_name << "] Waiting for compactions to settle...\n";
-  WaitForCompactions(db.get());
-
-  auto load_end = std::chrono::steady_clock::now();
-  result.load_duration_secs = std::chrono::duration<double>(load_end - load_start).count();
-
-  // Get stats after bulk load
-  IOStats io_after_load = GetIOStats(stats);
-  uint64_t disk_after_load = GetDiskUsage(db.get());
-  peak_disk = std::max(peak_disk, disk_after_load);
-
-  std::cout << "  [" << strategy_name << "] Bulk load complete. Disk usage: "
-            << HumanBytes(disk_after_load) << "\n";
 
   // Phase 2: Mixed workload
   std::cout << "  [" << strategy_name << "] Phase 2: Running mixed workload for "
@@ -539,16 +579,23 @@ Result RunBenchmark(const Config& cfg, const std::string& strategy_name,
 
   // Calculate results
   result.user_reads = workload_stats.reads.load();
-  result.user_bytes_written = user_bytes_written + workload_stats.bytes_written.load();
 
-  // Total physical bytes written = flush writes + compaction writes
-  // (FLUSH_WRITE_BYTES captures memtable->SST, COMPACT_WRITE_BYTES captures SST->SST)
-  result.total_bytes_written = io_after_load.flush_bytes_written + io_after_load.compact_bytes_written +
-                               io_final.flush_bytes_written + io_final.compact_bytes_written;
+  // In reuse_db mode, only count workload phase (no bulk load stats)
+  if (cfg.reuse_db) {
+    result.user_bytes_written = workload_stats.bytes_written.load();
+    result.total_bytes_written = io_final.flush_bytes_written + io_final.compact_bytes_written;
+  } else {
+    result.user_bytes_written = user_bytes_written + workload_stats.bytes_written.load();
+    // Total physical bytes written = flush writes + compaction writes
+    // (FLUSH_WRITE_BYTES captures memtable->SST, COMPACT_WRITE_BYTES captures SST->SST)
+    result.total_bytes_written = io_after_load.flush_bytes_written + io_after_load.compact_bytes_written +
+                                 io_final.flush_bytes_written + io_final.compact_bytes_written;
+  }
 
-  // Total read I/O during workload (user reads + compaction reads)
-  // Note: With direct I/O, this captures actual disk reads
-  result.bytes_read = io_final.bytes_read + io_final.compact_bytes_read;
+  // Read I/O measured via block cache misses (each miss = one block read from disk)
+  // With tiny 8KB cache, nearly everything misses, giving accurate disk read count
+  constexpr uint64_t kBlockSize = 4 * 1024;  // 4KB blocks
+  result.bytes_read = io_final.block_reads * kBlockSize;
 
   result.peak_disk_usage = peak_disk;
   result.final_disk_usage = final_disk;
